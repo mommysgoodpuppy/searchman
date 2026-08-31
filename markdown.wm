@@ -1,0 +1,573 @@
+-- Line-based markdown parser for terminal rendering.
+-- Adapts fresh editor's streaming approach to Workman: parse markdown into
+-- StyledLine lists, then render with tuiman's Draw primitives.
+-- Handles: fenced code blocks, inline code, bold, italic, headings,
+from "./submodules/tuiman/tui/draw.wm" import * as Draw;
+from "./submodules/tuiman/tui/geometry.wm" import * as Geometry;
+from "./submodules/tuiman/tui/theme.wm" import * as Theme;
+
+-- Styled span: text + style
+record Span = {
+  text: String,
+  style: Draw.Style,
+};
+
+-- A line of styled spans
+record Line = {
+  spans: List<Span>,
+};
+
+-- Style presets
+let bodyStyle = Draw.Style(
+  Some(Theme.light4),
+  Some(Theme.libadwaitaDark),
+  false,
+  false,
+  false,
+);
+
+let boldStyle = Draw.Style(
+  Some(Theme.light4),
+  Some(Theme.libadwaitaDark),
+  true,
+  false,
+  false,
+);
+
+let headingStyle = Draw.Style(
+  Some(Theme.blue2),
+  Some(Theme.libadwaitaDark),
+  true,
+  false,
+  false,
+);
+
+let codeStyle = Draw.Style(
+  Some(Theme.light4),
+  Some(Theme.libadwaitaDarkAlt),
+  false,
+  false,
+  false,
+);
+
+let linkStyle = Draw.Style(
+  Some(Theme.blue2),
+  Some(Theme.libadwaitaDark),
+  false,
+  false,
+  false,
+);
+
+let mutedStyle = Draw.Style(
+  Some(Theme.dark1),
+  Some(Theme.libadwaitaDark),
+  false,
+  false,
+  false,
+);
+
+let emptyLine = Line([]);
+
+let line = (spans) => { Line(spans) };
+let plainLine = (text) => { line([Span(text, bodyStyle)]) };
+
+-- String helpers
+let startsWith = (text, prefix) => {
+  text :> .startsWith(prefix) :> Result.withDefault(false)
+};
+
+let endsWith = (text, suffix) => {
+  text :> .endsWith(suffix) :> Result.withDefault(false)
+};
+
+let len = (text) => {
+  text :> .length :> Result.withDefault(0)
+};
+
+let slice = (text, start) => {
+  text :> .slice(start) :> Result.withDefault("")
+};
+
+let slice2 = (text, start, end) => {
+  text :> .slice(start, end) :> Result.withDefault("")
+};
+
+let trim = (text) => {
+  text :> .trim() :> Result.withDefault(text)
+};
+
+let findStr = (haystack, needle) => {
+  match(haystack :> .indexOf(needle)) {
+    Ok(idx) => { idx },
+    Err(_) => { -1 },
+  }
+};
+
+-- Check if a line is a fenced code block delimiter
+let isCodeFence = (text) => {
+  let t = trim(text);
+  startsWith(t, "```")
+};
+
+let fenceLang = (text) => {
+  let t = trim(text);
+  let lang = slice(t, 3);
+  trim(lang)
+};
+
+-- Check if a line is a heading (returns heading level, 0 = not heading)
+let headingLevel = (text) => {
+  let t = trim(text);
+  if (startsWith(t, "######")) {
+    6
+  } else {
+    if (startsWith(t, "#####")) {
+      5
+    } else {
+      if (startsWith(t, "####")) {
+        4
+      } else {
+        if (startsWith(t, "###")) {
+          3
+        } else {
+          if (startsWith(t, "##")) {
+            2
+          } else {
+            if (startsWith(t, "#")) {
+              1
+            } else {
+              0
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+-- Check if a line is a horizontal rule
+let isRule = (text) => {
+  let t = trim(text);
+  if (startsWith(t, "---")) {
+    true
+  } else {
+    if (startsWith(t, "***")) {
+      true
+    } else {
+      startsWith(t, "___")
+    }
+  }
+};
+
+-- Check if a line is an unordered list item, returns the marker (or "")
+let listMarker = (text) => {
+  let t = trim(text);
+  if (startsWith(t, "- ")) {
+    "- "
+  } else {
+    if (startsWith(t, "* ")) {
+      "* "
+    } else {
+      if (startsWith(t, "+ ")) {
+        "+ "
+      } else {
+        ""
+      }
+    }
+  }
+};
+
+-- Check if a line is an ordered list item (e.g. "1. " or "2) ")
+-- Returns the marker text or ""
+let isDigit = (c) => {
+  findStr("0123456789", c) >= 0
+};
+
+let rec orderedMarker = (text, index, chars) => {
+  let t = trim(text);
+  let c = slice2(t, index, index + 1);
+  if (index == 0 && isDigit(c)) {
+    orderedMarker(text, index + 1, chars ++ c)
+  } else {
+    if (index > 0 && isDigit(c)) {
+      orderedMarker(text, index + 1, chars ++ c)
+    } else {
+      if (index > 0 && c == "." && slice2(t, index + 1, index + 2) == " ") {
+        chars ++ ". "
+      } else {
+        if (index > 0 && c == ")" && slice2(t, index + 1, index + 2) == " ") {
+          chars ++ ") "
+        } else {
+          ""
+        }
+      }
+    }
+  }
+};
+
+-- Make a style with bold added
+let withBold = (s) => {
+  Draw.Style(s.foreground, s.background, true, s.dim, s.reverse)
+};
+
+-- Make a style with italic (dim) added
+let withItalic = (s) => {
+  Draw.Style(s.foreground, s.background, s.bold, true, s.reverse)
+};
+
+-- Parse inline markdown: **bold**, *italic*, `code`, [text](url), [N] citations
+-- Returns a list of Spans with appropriate styles.
+let rec parseInline = (text, style, pos, current, spans) => {
+  let n = len(text);
+  if (pos >= n) {
+    if (current != "") {
+      List.append(spans, [Span(current, style)])
+    } else {
+      spans
+    }
+  } else {
+    let two = slice2(text, pos, pos + 2);
+    let one = slice2(text, pos, pos + 1);
+    if (two == "**") {
+      let rest = slice(text, pos + 2);
+      let closeIdx = findStr(rest, "**");
+      if (closeIdx >= 0) {
+        let boldText = slice2(rest, 0, closeIdx);
+        let before = if (current != "") {
+          List.append(spans, [Span(current, style)])
+        } else {
+          spans
+        };
+        let boldSpan = [Span(boldText, withBold(style))];
+        parseInline(text, style, pos + 2 + closeIdx + 2, "", List.append(before, boldSpan))
+      } else {
+        parseInline(text, style, pos + 1, current ++ "**", spans)
+      }
+    } else {
+      if (one == "`") {
+        let rest = slice(text, pos + 1);
+        let closeIdx = findStr(rest, "`");
+        if (closeIdx >= 0) {
+          let codeText = slice2(rest, 0, closeIdx);
+          let before = if (current != "") {
+            List.append(spans, [Span(current, style)])
+          } else {
+            spans
+          };
+          let codeSpan = [Span(codeText, codeStyle)];
+          parseInline(text, style, pos + 1 + closeIdx + 1, "", List.append(before, codeSpan))
+        } else {
+          parseInline(text, style, pos + 1, current ++ "`", spans)
+        }
+      } else {
+        if (one == "[") {
+          let rest = slice(text, pos + 1);
+          let closeIdx = findStr(rest, "]");
+          if (closeIdx >= 0) {
+            let linkText = slice2(rest, 0, closeIdx);
+            let after = slice(rest, closeIdx + 1);
+            if (startsWith(after, "(")) {
+              let urlEnd = findStr(slice(after, 1), ")");
+              if (urlEnd >= 0) {
+                let before = if (current != "") {
+                  List.append(spans, [Span(current, style)])
+                } else {
+                  spans
+                };
+                let linkSpan = [Span(linkText, linkStyle)];
+                parseInline(text, style, pos + 1 + closeIdx + 1 + 1 + urlEnd + 1, "", List.append(before, linkSpan))
+              } else {
+                parseInline(text, style, pos + 1, current ++ "[", spans)
+              }
+            } else {
+              let before = if (current != "") {
+                List.append(spans, [Span(current, style)])
+              } else {
+                spans
+              };
+              let citeSpan = [Span("[" ++ linkText ++ "]", linkStyle)];
+              parseInline(text, style, pos + 1 + closeIdx + 1, "", List.append(before, citeSpan))
+            }
+          } else {
+            parseInline(text, style, pos + 1, current ++ "[", spans)
+          }
+        } else {
+          if (one == "*" && slice2(text, pos + 1, pos + 2) != "*") {
+            let rest = slice(text, pos + 1);
+            let closeIdx = findStr(rest, "*");
+            if (closeIdx >= 0) {
+              let italicText = slice2(rest, 0, closeIdx);
+              let before = if (current != "") {
+                List.append(spans, [Span(current, style)])
+              } else {
+                spans
+              };
+              let italicSpan = [Span(italicText, withItalic(style))];
+              parseInline(text, style, pos + 1 + closeIdx + 1, "", List.append(before, italicSpan))
+            } else {
+              parseInline(text, style, pos + 1, current ++ "*", spans)
+            }
+          } else {
+            parseInline(text, style, pos + 1, current ++ one, spans)
+          }
+        }
+      }
+    }
+  }
+};
+
+-- Parse a single line of markdown text (not in code block)
+let parseLine = (text) => {
+  line(parseInline(text, bodyStyle, 0, "", []))
+};
+
+-- Parse a heading line
+let parseHeading = (text, level) => {
+  let t = trim(text);
+  let content = trim(slice(t, level));
+  line(parseInline(content, headingStyle, 0, "", []))
+};
+
+-- Parse a list item line
+let parseListItem = (text, marker) => {
+  let t = trim(text);
+  let content = trim(slice(t, len(marker)));
+  let markerSpan = Span(marker, mutedStyle);
+  let contentSpans = parseInline(content, bodyStyle, 0, "", []);
+  line([markerSpan, ..contentSpans])
+};
+
+-- Parse a code block line (uniform styling, no inline parsing)
+let parseCodeLine = (text) => {
+  line([Span(text, codeStyle)])
+};
+
+-- Parse a horizontal rule
+let ruleLine = () => {
+  line([Span("────────────────────────────────────────", mutedStyle)])
+};
+
+-- Main parser: markdown text -> List<Line>
+let rec parse = (lines, inCode, result) => {
+  match(lines) {
+    [] => { result },
+    [current, ..rest] => {
+      if (inCode) {
+        if (isCodeFence(current)) {
+          parse(rest, false, List.append(result, [emptyLine]))
+        } else {
+          parse(rest, true, List.append(result, [parseCodeLine(current)]))
+        }
+      } else {
+        if (isCodeFence(current)) {
+          parse(rest, true, List.append(result, [emptyLine]))
+        } else {
+          if (isRule(current)) {
+            parse(rest, false, List.append(result, [ruleLine(), emptyLine]))
+          } else {
+            if (trim(current) == "") {
+              parse(rest, false, List.append(result, [emptyLine]))
+            } else {
+              let level = headingLevel(current);
+              if (level > 0) {
+                parse(rest, false, List.append(result, [parseHeading(current, level), emptyLine]))
+              } else {
+                let marker = listMarker(current);
+                if (marker != "") {
+                  parse(rest, false, List.append(result, [parseListItem(current, marker)]))
+                } else {
+                  let ordMarker = orderedMarker(current, 0, "");
+                  if (ordMarker != "") {
+                    parse(rest, false, List.append(result, [parseListItem(current, ordMarker)]))
+                  } else {
+                    parse(rest, false, List.append(result, [parseLine(current)]))
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+-- Entry point: parse markdown text into styled lines
+let parseMarkdown = (text: String) => {
+  let lines = text :> .split("\n") :> Result.map(Js.Array.toList) :> Result.withDefault([]);
+  parse(lines, false, [])
+};
+
+-- Extract plain text from a Line (for wrapping)
+let rec spansText = match(spans) => {
+  [] => { "" },
+  [span, ..rest] => { span.text ++ spansText(rest) }
+};
+
+let lineText = (l) => { spansText(l.spans) };
+
+-- Build a styled line from plain text by matching against original spans
+let rec styledFromText = (text, spans) => {
+  match(spans) {
+    [] => { plainLine(text) },
+    [span, ..rest] => {
+      if (startsWith(text, span.text)) {
+        let remaining = slice(text, len(span.text));
+        if (remaining == "") {
+          line([span])
+        } else {
+          let restLine = styledFromText(remaining, rest);
+          line([span, ..restLine.spans])
+        }
+      } else {
+        plainLine(text)
+      }
+    }
+  }
+};
+
+-- Word-wrap a styled line, preserving styles across breaks.
+-- Returns a list of Lines.
+let rec wrapStyledLine = (l, width) => {
+  let text = lineText(l);
+  if (len(text) <= width) {
+    [l]
+  } else {
+    let wrapped = Draw.wrap(text, width);
+    let rec toStyled = match(wrappedLines) => {
+      [] => { [] },
+      [head, ..tail] => {
+        [styledFromText(head, l.spans), ..toStyled(tail)]
+      }
+    };
+    toStyled(wrapped)
+  }
+};
+
+-- Wrap all styled lines to fit width
+let rec wrapAll = (lines, width) => {
+  match(lines) {
+    [] => { [] },
+    [head, ..rest] => {
+      List.append(wrapStyledLine(head, width), wrapAll(rest, width))
+    }
+  }
+};
+
+-- Render a single styled line at position y
+let rec renderLine = (area: Geometry.Rect, l: Line, y: Number) => {
+  let rec renderSpans = match(x, spans) => {
+    (_, []) => { "" },
+    (x, [span, ..rest]) => {
+      let truncated = Draw.truncate(span.text, area.width - (x - area.x));
+      Draw.at(x, y, truncated, span.style) ++ renderSpans(x + Draw.widthOf(truncated), rest)
+    }
+  };
+  renderSpans(area.x, l.spans)
+};
+
+-- Render styled lines to ANSI string at position
+let rec renderLines = match(area, lines, y) => {
+  (_, [], _) => { "" },
+  (area, [head, ..tail], y) => {
+    if (y >= area.y + area.height) {
+      ""
+    } else {
+      renderLine(area, head, y) ++ renderLines(area, tail, y + 1)
+    }
+  }
+};
+
+-- Extract plain text from a character-level selection.
+-- Re-parses and wraps the answer text, then extracts text from
+-- (startRow, startCol) to (endRow, endCol) inclusive.
+let rec extractCharRange = (text, startCol, endCol, pos, result) => {
+  if (pos >= endCol) {
+    result
+  } else {
+    if (pos < startCol) {
+      extractCharRange(text, startCol, endCol, pos + 1, result)
+    } else {
+      let ch = slice2(text, pos, pos + 1);
+      extractCharRange(text, startCol, endCol, pos + 1, result ++ ch)
+    }
+  }
+};
+
+let rec extractSelection = match(lines, index, startRow, startCol, endRow, endCol) => {
+  ([], _, _, _, _, _) => { "" },
+  ([head, ..tail], index, startRow, startCol, endRow, endCol) => {
+    if (index < startRow) {
+      extractSelection(tail, index + 1, startRow, startCol, endRow, endCol)
+    } else {
+      if (index > endRow) {
+        ""
+      } else {
+        let text = lineText(head);
+        let lineLen = len(text);
+        let part = if (index == startRow && index == endRow) {
+          -- Single line: extract [startCol, endCol]
+          extractCharRange(text, startCol, endCol + 1, 0, "")
+        } else {
+          if (index == startRow) {
+            -- First line: extract from startCol to end
+            extractCharRange(text, startCol, lineLen, 0, "")
+          } else {
+            if (index == endRow) {
+              -- Last line: extract from 0 to endCol
+              extractCharRange(text, 0, endCol + 1, 0, "")
+            } else {
+              -- Middle line: whole line
+              text
+            }
+          }
+        };
+        if (index == endRow) {
+          part
+        } else {
+          part ++ "\n" ++ extractSelection(tail, index + 1, startRow, startCol, endRow, endCol)
+        }
+      }
+    }
+  },
+};
+
+let selectedText = (text: String, width: Number, startRow: Number, startCol: Number, endRow: Number, endCol: Number) => {
+  let parsed = parseMarkdown(text);
+  let wrapped = wrapAll(parsed, width);
+  -- Normalize so start <= end
+  let (sr, sc, er, ec) = if (startRow < endRow || (startRow == endRow && startCol <= endCol)) {
+    (startRow, startCol, endRow, endCol)
+  } else {
+    (endRow, endCol, startRow, startCol)
+  };
+  extractSelection(wrapped, 0, sr, sc, er, ec)
+};
+
+-- Extract all code block content from markdown text.
+-- Returns code blocks separated by newlines.
+let rec extractCode = match(lines, inCode, current) => {
+  ([], false, _) => { "" },
+  ([], true, current) => { current },
+  ([line, ..rest], false, _) => {
+    if (isCodeFence(line)) {
+      extractCode(rest, true, "")
+    } else {
+      extractCode(rest, false, "")
+    }
+  },
+  ([line, ..rest], true, current) => {
+    if (isCodeFence(line)) {
+      let block = if (current == "") { "" } else { current ++ "\n" };
+      block ++ extractCode(rest, false, "")
+    } else {
+      let next = if (current == "") { line } else { current ++ "\n" ++ line };
+      extractCode(rest, true, next)
+    }
+  },
+};
+
+let extractCodeBlocks = (text: String) => {
+  let lines = text :> .split("\n") :> Result.map(Js.Array.toList) :> Result.withDefault([]);
+  extractCode(lines, false, "")
+};

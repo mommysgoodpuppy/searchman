@@ -1,0 +1,274 @@
+-- searchman: terminal web search via Exa, rendered with tuiman.
+
+from "./exa.wm" import * as Exa;
+from "./model.wm" import *;
+from "./markdown.wm" import * as Markdown;
+from "./render.wm" import { render };
+from js.module("./clipboard.ts") import { copyToClipboard };
+from "./submodules/tuiman/tui/command.wm" import * as Command;
+from "./submodules/tuiman/tui/event.wm" import * as Event;
+from "./submodules/tuiman/tui/runtime.wm" import * as Runtime;
+from js.global("Deno") import {
+  args: Js.Array<String>,
+};
+
+let usage = `searchman — terminal web search
+
+usage:
+  wm run main.wm -- "how to detect if terminal is windows terminal"
+
+requires:
+  EXA_API_KEY environment variable set to your Exa API key`;
+
+let rec joinWords = match(words) => {
+  [] => { "" },
+  [only] => { only },
+  [head, ..tail] => { head ++ " " ++ joinWords(tail) },
+};
+
+let setScroll = (model, scroll) => {
+  Model(
+    model.query,
+    model.answer,
+    model.sources,
+    scroll,
+    model.selection,
+    model.mouseDrag,
+    model.status,
+    model.wrapWidth,
+  )
+};
+
+let setStatus = (model, status) => {
+  Model(
+    model.query,
+    model.answer,
+    model.sources,
+    model.scroll,
+    model.selection,
+    model.mouseDrag,
+    status,
+    model.wrapWidth,
+  )
+};
+
+let clearSelection = (model) => {
+  Model(
+    model.query,
+    model.answer,
+    model.sources,
+    model.scroll,
+    None,
+    false,
+    model.status,
+    model.wrapWidth,
+  )
+};
+
+
+let scrollUp = (model) => {
+  let next = model.scroll - 1;
+  setScroll(model, if (next < 0) { 0 } else { next })
+};
+
+let scrollDown = (model) => {
+  setScroll(model, model.scroll + 1)
+};
+
+-- Clamp selection to valid range, normalizing start <= end
+let normalizeSelection = (a, b) => {
+  if (a <= b) {
+    Some((a, b))
+  } else {
+    Some((b, a))
+  }
+};
+
+-- Map a digit character to its 1-based index, None for non-digits/0
+let digitIndex = match(c) => {
+  "1" => { Some(1) },
+  "2" => { Some(2) },
+  "3" => { Some(3) },
+  "4" => { Some(4) },
+  "5" => { Some(5) },
+  "6" => { Some(6) },
+  "7" => { Some(7) },
+  "8" => { Some(8) },
+  "9" => { Some(9) },
+  _ => { None },
+};
+
+-- Fetch the Nth source (1-based), None if out of range
+let rec sourceAt = match(sources, n) => {
+  ([], _) => { None },
+  ([head, ..rest], n) => {
+    if (n <= 1) { Some(head) } else { sourceAt(rest, n - 1) }
+  },
+};
+
+let update = match(key, model) => {
+  (Event.CtrlC, _) => { Command.Quit },
+  (Event.Character("q"), _) => { Command.Quit },
+  (Event.Up, _) => { Command.Continue(scrollUp(model)) },
+  (Event.Character("k"), _) => { Command.Continue(scrollUp(model)) },
+  (Event.Down, _) => { Command.Continue(scrollDown(model)) },
+  (Event.Character("j"), _) => { Command.Continue(scrollDown(model)) },
+  (Event.PageUp, _) => {
+    Command.Continue(setScroll(model, model.scroll - 10))
+  },
+  (Event.PageDown, _) => {
+    Command.Continue(setScroll(model, model.scroll + 10))
+  },
+  -- Mouse down: start selection at clicked position.
+  -- Answer inner area starts at y=1, x=1 (after borders), so subtract 1.
+  (Event.MouseDown(col, row), _) => {
+    let absRow = row - 1 + model.scroll;
+    let relCol = col - 1;
+    Command.Continue(Model(
+      model.query,
+      model.answer,
+      model.sources,
+      model.scroll,
+      Some((absRow, relCol, absRow, relCol)),
+      true,
+      model.status,
+      model.wrapWidth,
+    ))
+  },
+  -- Mouse drag: extend selection to dragged position
+  (Event.MouseDrag(col, row), _) => {
+    if (model.mouseDrag) {
+      let absRow = row - 1 + model.scroll;
+      let relCol = col - 1;
+      match(model.selection) {
+        None => { Command.Continue(model) },
+        Some(sel) => {
+          let (startRow, startCol, _, _) = sel;
+          Command.Continue(Model(
+            model.query,
+            model.answer,
+            model.sources,
+            model.scroll,
+            Some((startRow, startCol, absRow, relCol)),
+            true,
+            model.status,
+            model.wrapWidth,
+          ))
+        },
+      }
+    } else {
+      Command.Continue(model)
+    }
+  },
+  -- Mouse up: stop dragging (selection persists for copying)
+  (Event.MouseUp(col, row), _) => {
+    Command.Continue(Model(
+      model.query,
+      model.answer,
+      model.sources,
+      model.scroll,
+      model.selection,
+      false,
+      model.status,
+      model.wrapWidth,
+    ))
+  },
+  -- Escape: clear selection
+  (Event.Escape, _) => {
+    Command.Continue(clearSelection(model))
+  },
+  -- c: copy all code blocks to system clipboard
+  (Event.Character("c"), _) => {
+    let code = Markdown.extractCodeBlocks(model.answer);
+    if (code == "") {
+      Command.Continue(setStatus(model, "no code blocks found"))
+    } else {
+      Command.Spawn(
+        setStatus(model, "copying code..."),
+        copyToClipboard(code)
+          :> Task.map((_) => {
+            (_) => { setStatus(model, "code copied to clipboard") }
+          })
+          :> Task.mapErr((_) => {
+            (_) => { setStatus(model, "copy failed") }
+          })
+      )
+    }
+  },
+  (Event.Character("y"), _) => {
+    match(model.selection) {
+      None => { Command.Continue(setStatus(model, "no selection")) },
+      Some(sel) => {
+        let (startRow, startCol, endRow, endCol) = sel;
+        let text = Markdown.selectedText(model.answer, model.wrapWidth, startRow, startCol, endRow, endCol);
+        Command.Spawn(
+          setStatus(model, "copying..."),
+          copyToClipboard(text)
+            :> Task.map((_) => {
+              (_) => { setStatus(model, "copied to clipboard") }
+            })
+            :> Task.mapErr((_) => {
+              (_) => { setStatus(model, "copy failed") }
+            })
+        )
+      },
+    }
+  },
+  -- 1-9: copy source N's URL to clipboard
+  (Event.Character(digit), _) => {
+    match(digitIndex(digit)) {
+      None => { Command.Continue(model) },
+      Some(n) => {
+        match(sourceAt(model.sources, n)) {
+          None => { Command.Continue(setStatus(model, "no source " ++ Text.of(n))) },
+          Some(source) => {
+            Command.Spawn(
+              setStatus(model, "copying source " ++ Text.of(n) ++ "..."),
+              copyToClipboard(source.url)
+                :> Task.map((_) => {
+                  (_) => { setStatus(model, "source " ++ Text.of(n) ++ " copied") }
+                })
+                :> Task.mapErr((_) => {
+                  (_) => { setStatus(model, "copy failed") }
+                })
+            )
+          },
+        }
+      },
+    }
+  },
+  _ => { Command.Continue(model) },
+};
+let launch = (query, answer, sources) => {
+  Runtime.run(Model(query, answer, sources, 0, None, false, "", 80), update, render)
+};
+
+let jsErrorText = match(error) => {
+  Js.Error(message) => { message },
+  Js.Unknown => { "unknown error" },
+};
+
+let main = () => {
+  match(args) {
+    Err(error) => {
+      Task.succeed(print("could not read arguments: " ++ jsErrorText(error)))
+    },
+    Ok(values) => {
+      match(Js.Array.toList(values)) {
+        [] => { Task.succeed(print(usage)) },
+        _ => {
+          let query = joinWords(Js.Array.toList(values));
+          Exa.search(query)
+            :> Task.map((result) => {
+              let (answer, sources) = result;
+              launch(query, answer, sources)
+            })
+            :> Task.recover((error) => {
+              print("searchman: " ++ Exa.describeError(error));
+              void
+            })
+        },
+      }
+    },
+  };
+};

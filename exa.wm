@@ -1,0 +1,95 @@
+-- Exa API client.
+-- Uses a TS shim for the fetch+JSON.stringify call to avoid the partial-inference
+-- FFI export bug (see workman/markdown/issues/partial-inference-drops-ffi-blocked-export.md).
+-- The shim returns Js.Value; we decode with Json.assert (same pattern as problems TUI).
+
+from js.module("./exa.ts") import {
+  exaSearch: (String, String) -> Task<Js.Value, Js.Error>,
+};
+from js.global("Deno") import { readTextFile };
+
+record Source = {
+  title: String,
+  url: String,
+};
+
+record ExaResult = {
+  answer: String,
+  sources: Js.Array<Source>,
+};
+
+type ExaError =
+  | MissingApiKey
+  | HttpFailure<Number, String>
+  | JsFailure<Js.Error>;
+
+let describeError = match(error) => {
+  MissingApiKey => { "EXA_KEY not set in .env" },
+  HttpFailure(status, body) => {
+    "HTTP " ++ Text.of(status) ++ ": " ++ body
+  },
+  JsFailure(jsError) => {
+    match(jsError) {
+      Js.Error(message) => { message },
+      Js.Unknown => { "unknown JavaScript error" },
+    }
+  },
+};
+
+let unquote = (text) => {
+  text :> .trim() :> Result.andThen((t) => {
+    Result|
+      t :> .startsWith("\""),
+      t :> .endsWith("\"")
+    | :> Result.andThen((starts, ends) => {
+      if (starts && ends) {
+        t :> .slice(1, -1)
+      } else {
+        Ok(t)
+      }
+    })
+  }) :> Result.withDefault(text)
+};
+
+let rec findKey = match(lines) => {
+  [] => { Ok(None) },
+  [line, ..rest] => {
+    line :> .startsWith("EXA_KEY=") :> Result.andThen((matches) => {
+      if (matches) {
+        line :> .slice(8) :> Result.map(unquote) :> Result.map(Some)
+      } else {
+        findKey(rest)
+      }
+    })
+  },
+};
+
+let loadKey = () => {
+  readTextFile(".env")
+    :> Task.mapErr(JsFailure)
+    :> Task.andThen((text) => {
+      text :> .split("\n") :> Result.andThen((lines) => {
+        findKey(Js.Array.toList(lines))
+      }) :> Result.andThen((found) => {
+        match(found) {
+          None => { Err(Js.Error("EXA_KEY not found in .env")) },
+          Some(key) => { Ok(key) },
+        }
+      }) :> Task.fromResult :> Task.mapErr(JsFailure)
+    })
+};
+
+let search = (query: String) => {
+  loadKey()
+    :> Task.andThen((key) => {
+      exaSearch(key, query)
+        :> Task.mapErr(JsFailure)
+        :> Task.andThen((value) => {
+          let decoded: Result<ExaResult, Js.Error> = value :> Json.assert;
+          decoded :> Task.fromResult :> Task.mapErr(JsFailure)
+        })
+        :> Task.map((result) => {
+          (result.answer, Js.Array.toList(result.sources))
+        })
+    })
+};

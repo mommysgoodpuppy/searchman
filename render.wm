@@ -1,0 +1,175 @@
+-- TUI render for searchman: answer text (scrollable) + source list + footer.
+
+from "./model.wm" import *;
+from "./markdown.wm" import * as Markdown;
+from "./submodules/tuiman/tui/draw.wm" import * as Draw;
+from "./submodules/tuiman/tui/geometry.wm" import * as Geometry;
+
+let rec drop = match(count, list) => {
+  (0, list) => { list },
+  (_, []) => { [] },
+  (count, [_, ..rest]) => { drop(count - 1, rest) },
+};
+
+let rec take = match(count, list) => {
+  (0, _) => { [] },
+  (_, []) => { [] },
+  (count, [head, ..rest]) => { [head, ..take(count - 1, rest)] },
+};
+
+let rec sourceLines = match(sources, index) => {
+  ([], _) => { [] },
+  ([source, ..rest], index) => {
+    [Text.of(index) ++ ". " ++ source.title ++ "  " ++ source.url, ..sourceLines(rest, index + 1)]
+  },
+};
+
+-- Normalized selection for one row: None = row not selected,
+-- Some(from, to) = character column range [from, to) selected.
+let rowSelection = (selection, absRow) => {
+  match(selection) {
+    None => { None },
+    Some(sel) => {
+      let (sr, sc, er, ec) = sel;
+      -- Normalize so (sr, sc) <= (er, ec)
+      let (nSr, nSc, nEr, nEc) = if (sr < er || (sr == er && sc <= ec)) {
+        (sr, sc, er, ec)
+      } else {
+        (er, ec, sr, sc)
+      };
+      if (absRow < nSr || absRow > nEr) {
+        None
+      } else {
+        if (nSr == nEr) {
+          Some((nSc, nEc + 1))
+        } else {
+          if (absRow == nSr) {
+            Some((nSc, 100000))
+          } else {
+            if (absRow == nEr) {
+              Some((0, nEc + 1))
+            } else {
+              Some((0, 100000))
+            }
+          }
+        }
+      }
+    },
+  }
+};
+
+-- Reverse a style for selection highlight
+let reverseStyle = (s) => {
+  Draw.Style(s.foreground, s.background, s.bold, s.dim, true)
+};
+
+let strLen = (text) => {
+  text :> .length :> Result.withDefault(0)
+};
+
+let strSlice = (text, start, end_) => {
+  text :> .slice(start, end_) :> Result.withDefault("")
+};
+
+-- Render one span's text split at character columns [from, to).
+-- Chars inside the range get the reversed style.
+let rec renderSpanSel = (x, y, text, pos, selFrom, selTo, style, maxX, out) => {
+  if (pos >= strLen(text)) {
+    out
+  } else {
+    let segEnd = if (pos < selFrom) {
+      selFrom
+    } else {
+      if (pos < selTo) { selTo } else { strLen(text) }
+    };
+    let seg = strSlice(text, pos, segEnd);
+    let segStyle = if (pos >= selFrom && pos < selTo) { reverseStyle(style) } else { style };
+    let width = Draw.widthOf(seg);
+    let drawn = if (x < maxX) {
+      Draw.at(x, y, Draw.truncate(seg, maxX - x), segStyle)
+    } else {
+      ""
+    };
+    renderSpanSel(x + width, y, text, segEnd, selFrom, selTo, style, maxX, out ++ drawn)
+  }
+};
+
+-- Render a single styled line at position y with char-range selection
+let rec renderLineSel = (area, l, y, selRange, x, spans, out) => {
+  match(spans) {
+    [] => { out },
+    [span, ..rest] => {
+      let maxX = area.x + area.width;
+      let width = Draw.widthOf(span.text);
+      let nextX = x + width;
+      if (nextX <= area.x || x >= maxX) {
+        renderLineSel(area, l, y, selRange, nextX, rest, out)
+      } else {
+        let drawn = match(selRange) {
+          None => { Draw.at(x, y, Draw.truncate(span.text, maxX - x), span.style) },
+          Some(range) => {
+            let (selFrom, selTo) = range;
+            renderSpanSel(x, y, span.text, 0, selFrom, selTo, span.style, maxX, "")
+          },
+        };
+        renderLineSel(area, l, y, selRange, nextX, rest, out ++ drawn)
+      }
+    }
+  }
+};
+
+-- Render styled lines with character-level selection highlight
+let rec renderLinesSel = match(area, lines, y, scroll, selection) => {
+  (_, [], _, _, _) => { "" },
+  (area, [head, ..tail], y, scroll, selection) => {
+    if (y >= area.y + area.height) {
+      ""
+    } else {
+      let absRow = scroll + (y - area.y);
+      let selRange = rowSelection(selection, absRow);
+      let drawn = renderLineSel(area, head, y, selRange, area.x, head.spans, "");
+      drawn ++ renderLinesSel(area, tail, y + 1, scroll, selection)
+    }
+  }
+};
+
+let render = (_, model, size) => {
+  let (body, footer) = Geometry.reserveBottom(Geometry.screen(size), 1);
+  let sourceCount = List.length(model.sources);
+  let sourceHeight = Geometry.clamp(3, 10, sourceCount + 2);
+  let (answerArea, sourcesArea) = Geometry.reserveBottom(body, sourceHeight);
+  let answerInner = Geometry.inset(answerArea, 1);
+  let sourcesInner = Geometry.inset(sourcesArea, 1);
+
+  let parsed = Markdown.parseMarkdown(model.answer);
+  let wrapped = Markdown.wrapAll(parsed, answerInner.width);
+  let total = List.length(wrapped);
+  let maxScroll = if (total <= answerInner.height) {
+    0
+  } else {
+    total - answerInner.height
+  };
+  let scroll = Geometry.clamp(0, maxScroll, model.scroll);
+  let visible = take(answerInner.height, drop(scroll, wrapped));
+
+  let scrollIndicator = if (total > answerInner.height) {
+    " [" ++ Text.of(scroll) ++ "/" ++ Text.of(maxScroll) ++ "]"
+  } else {
+    ""
+  };
+
+  let statusMsg = if (model.status == "") {
+    ""
+  } else {
+    "  " ++ model.status
+  };
+
+  Draw.beginFrame ++
+    Draw.box(answerArea, "Answer" ++ scrollIndicator, true) ++
+    renderLinesSel(answerInner, visible, answerInner.y, scroll, model.selection) ++
+    Draw.box(sourcesArea, "Sources", false) ++
+    Draw.lines(sourcesInner, sourceLines(model.sources, 1), Draw.muted) ++
+    Draw.fill(footer, " ", Draw.status) ++
+    Draw.text(footer, " j/k scroll   y copy   c code   1-9 source   esc clear   q quit" ++ statusMsg, Draw.status) ++
+    Draw.endFrame
+};

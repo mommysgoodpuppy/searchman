@@ -1,0 +1,19 @@
+-- Application state for the searchman TUI.
+
+from "./exa.wm" import { Source };
+
+record Model = {
+  query: String,
+  answer: String,
+  sources: List<Source>,
+  scroll: Number,
+  -- Selection: (startRow, startCol, endRow, endCol) — absolute row/col into
+  -- the wrapped line list. None = no selection.
+  selection: Option<(Number, Number, Number, Number)>,
+  -- True while mouse is dragging to select.
+  mouseDrag: Bool,
+  -- Status message shown in footer (e.g. "copied 3 lines").
+  status: String,
+  -- Last known answer area width for re-wrapping during text extraction.
+  wrapWidth: Number,
+};

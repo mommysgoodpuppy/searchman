@@ -1,0 +1,21 @@
+from "./submodules/tuiman/tui/event.wm" import * as Event;
+from "./submodules/tuiman/tui/ansi.wm" import { esc };
+
+let describe = match(key) => {
+  Event.MouseDown(col, row) => { "down " ++ Text.of(col) ++ "," ++ Text.of(row) },
+  Event.MouseDrag(col, row) => { "drag " ++ Text.of(col) ++ "," ++ Text.of(row) },
+  Event.MouseUp(col, row) => { "up " ++ Text.of(col) ++ "," ++ Text.of(row) },
+  Event.Character(c) => { "char " ++ c },
+  Event.Unknown(raw) => { "unknown " ++ raw },
+  _ => { "other" },
+};
+
+let rec describeAll = match(keys) => {
+  [] => { "" },
+  [head, ..tail] => { describe(head) ++ "\n" ++ describeAll(tail) },
+};
+
+let main = () => {
+  let input = esc ++ "[<0;3;3M" ++ esc ++ "[<32;8;3M" ++ esc ++ "[<0;8;3m";
+  print(describeAll(Event.decodeMany(input)));
+};

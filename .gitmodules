@@ -1,0 +1,3 @@
+[submodule "submodules/tuiman"]
+	path = submodules/tuiman
+	url = https://github.com/mommysgoodpuppy/tuiman.git

@@ -1,6 +1,10 @@
 // Exa API shim: handles fetch + JSON stringify to avoid FFI partial-inference issue.
 // Returns a plain object decoded via Json.assert on the Workman side.
 
+export function readEnvFile(_unused: string): Promise<string> {
+  return Deno.readTextFile(new URL(".env", import.meta.url));
+}
+
 export async function exaSearch(apiKey: string, query: string): Promise<{ answer: string; sources: { title: string; url: string }[] }> {
   const response = await fetch("https://api.exa.ai/answer", {
     method: "POST",

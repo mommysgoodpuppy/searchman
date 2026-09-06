@@ -5,8 +5,8 @@
 
 from js.module("./exa.ts") import {
   exaSearch: (String, String) -> Task<Js.Value, Js.Error>,
+  readEnvFile: String -> Task<String, Js.Error>,
 };
-from js.global("Deno") import { readTextFile };
 
 record Source = {
   title: String,
@@ -65,7 +65,7 @@ let rec findKey = match(lines) => {
 };
 
 let loadKey = () => {
-  readTextFile(".env")
+  readEnvFile("")
     :> Task.mapErr(JsFailure)
     :> Task.andThen((text) => {
       text :> .split("\n") :> Result.andThen((lines) => {

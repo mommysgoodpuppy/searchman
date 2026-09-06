@@ -95,24 +95,25 @@ let rec renderSpanSel = (x, y, text, pos, selFrom, selTo, style, maxX, out) => {
 };
 
 -- Render a single styled line at position y with char-range selection
-let rec renderLineSel = (area, l, y, selRange, x, spans, out) => {
+let rec renderLineSel = (area, l, y, selRange, x, textPos, spans, out) => {
   match(spans) {
     [] => { out },
     [span, ..rest] => {
       let maxX = area.x + area.width;
       let width = Draw.widthOf(span.text);
+      let textLen = strLen(span.text);
       let nextX = x + width;
       if (nextX <= area.x || x >= maxX) {
-        renderLineSel(area, l, y, selRange, nextX, rest, out)
+        renderLineSel(area, l, y, selRange, nextX, textPos + textLen, rest, out)
       } else {
         let drawn = match(selRange) {
           None => { Draw.at(x, y, Draw.truncate(span.text, maxX - x), span.style) },
           Some(range) => {
             let (selFrom, selTo) = range;
-            renderSpanSel(x, y, span.text, 0, selFrom, selTo, span.style, maxX, "")
+            renderSpanSel(x, y, span.text, 0, selFrom - textPos, selTo - textPos, span.style, maxX, "")
           },
         };
-        renderLineSel(area, l, y, selRange, nextX, rest, out ++ drawn)
+        renderLineSel(area, l, y, selRange, nextX, textPos + textLen, rest, out ++ drawn)
       }
     }
   }
@@ -127,7 +128,7 @@ let rec renderLinesSel = match(area, lines, y, scroll, selection) => {
     } else {
       let absRow = scroll + (y - area.y);
       let selRange = rowSelection(selection, absRow);
-      let drawn = renderLineSel(area, head, y, selRange, area.x, head.spans, "");
+      let drawn = renderLineSel(area, head, y, selRange, area.x, 0, head.spans, "");
       drawn ++ renderLinesSel(area, tail, y + 1, scroll, selection)
     }
   }

@@ -16,6 +16,7 @@ let usage = `searchman — terminal web search
 
 usage:
   wm run main.wm -- "how to detect if terminal is windows terminal"
+  wm run main.wm -- -a "print only the answer"
 
 requires:
   EXA_API_KEY environment variable set to your Exa API key`;
@@ -24,6 +25,18 @@ let rec joinWords = match(words) => {
   [] => { "" },
   [only] => { only },
   [head, ..tail] => { head ++ " " ++ joinWords(tail) },
+};
+
+let rec plainSources = match(sources, index) => {
+  ([], _) => { "" },
+  ([source, ..rest], index) => {
+    Text.of(index) ++ ". " ++ source.title ++ "\n" ++ source.url ++ "\n" ++
+      plainSources(rest, index + 1)
+  },
+};
+
+let persistedOutput = (model) => {
+  "\n" ++ model.answer ++ "\n\nSources\n" ++ plainSources(model.sources, 1)
 };
 
 let setScroll = (model, scroll) => {
@@ -240,7 +253,12 @@ let update = match(key, model) => {
   _ => { Command.Continue(model) },
 };
 let launch = (query, answer, sources) => {
-  Runtime.run(Model(query, answer, sources, 0, None, false, "", 80), update, render)
+  Runtime.runPersisted(
+    Model(query, answer, sources, 0, None, false, "", 80),
+    update,
+    render,
+    persistedOutput,
+  )
 };
 
 let jsErrorText = match(error) => {
@@ -254,14 +272,23 @@ let main = () => {
       Task.succeed(print("could not read arguments: " ++ jsErrorText(error)))
     },
     Ok(values) => {
-      match(Js.Array.toList(values)) {
+      let words = Js.Array.toList(values);
+      match(words) {
         [] => { Task.succeed(print(usage)) },
         _ => {
-          let query = joinWords(Js.Array.toList(values));
+          let (answerOnly, queryWords) = match(words) {
+            ["-a", ..rest] => { (true, rest) },
+            _ => { (false, words) },
+          };
+          let query = joinWords(queryWords);
           Exa.search(query)
             :> Task.map((result) => {
               let (answer, sources) = result;
-              launch(query, answer, sources)
+              if (answerOnly) {
+                print(answer)
+              } else {
+                launch(query, answer, sources)
+              }
             })
             :> Task.recover((error) => {
               print("searchman: " ++ Exa.describeError(error));
